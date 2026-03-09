@@ -68,6 +68,8 @@ const client = new MongoClient(process.env.MONGO_URI, {
 let booksCollection;
 let usersCollection;
 let librarianRequestsCollection;
+let wishlistsCollection;
+let reviewsCollection;
 
 async function run() {
   try {
@@ -79,6 +81,8 @@ async function run() {
     ordersCollection = db.collection("orders");
     usersCollection = db.collection("users");
     librarianRequestsCollection = db.collection("librarianRequests");
+    wishlistsCollection = db.collection("wishlists");
+    reviewsCollection = db.collection("reviews");
 
     // ================= TOKEN VERIFICATION MIDDLEWARE =================
     const verifyToken = async (req, res, next) => {
@@ -94,7 +98,6 @@ async function run() {
         const decodedToken = await admin.auth().verifyIdToken(idToken);
         req.user = decodedToken;
 
-        // Look up role from MongoDB — Firebase token doesn't carry role
         const dbUser = await usersCollection.findOne({ uid: decodedToken.uid });
         req.user.role = dbUser?.role || "user";
 
@@ -159,16 +162,26 @@ async function run() {
 
     // ================= USER ROUTES =================
     app.post("/api/user", async (req, res) => {
-      const { email, displayName, uid } = req.body;
+      const { email, displayName, uid, photoURL } = req.body;
       if (!email) return res.status(400).json({ error: "Email required" });
       try {
         let user = await usersCollection.findOne({ email });
         if (!user) {
-          const newUser = { uid, email, displayName: displayName || "User", role: "user", createdAt: new Date() };
+          const newUser = {
+            uid,
+            email,
+            displayName: displayName || "User",
+            photoURL: photoURL || "",
+            role: "user",
+            createdAt: new Date(),
+          };
           const result = await usersCollection.insertOne(newUser);
           user = { _id: result.insertedId, ...newUser };
+        } else if (photoURL && !user.photoURL) {
+          await usersCollection.updateOne({ email }, { $set: { photoURL } });
+          user.photoURL = photoURL;
         }
-        res.json({ _id: user._id, email: user.email, displayName: user.displayName, role: user.role });
+        res.json({ _id: user._id, email: user.email, displayName: user.displayName, role: user.role, photoURL: user.photoURL });
       } catch (err) {
         console.error(err);
         res.status(500).json({ error: "Failed to sync user" });
@@ -202,7 +215,6 @@ async function run() {
       }
     });
 
-    // ✅ DELETE /api/users/:id — admin only
     app.delete("/api/users/:id", verifyToken, async (req, res) => {
       if (req.user.role !== "admin") {
         return res.status(403).json({ error: "Only admins can delete users." });
@@ -211,13 +223,11 @@ async function run() {
         const target = await usersCollection.findOne({ _id: new ObjectId(req.params.id) });
         if (!target) return res.status(404).json({ error: "User not found" });
 
-        // Prevent admin from deleting themselves
         if (target.uid === req.user.uid) {
           return res.status(400).json({ error: "You cannot delete your own account." });
         }
 
         await usersCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-        // Clean up their orders too
         await ordersCollection.deleteMany({ email: target.email });
 
         res.json({ message: "User deleted successfully" });
@@ -264,7 +274,6 @@ async function run() {
       }
     });
 
-    // ✅ GET /api/my-librarian-request — check if user has a request and its status
     app.get("/api/my-librarian-request", verifyToken, async (req, res) => {
       const { uid } = req.query;
       if (!uid) return res.status(400).json({ error: "UID required" });
@@ -343,7 +352,6 @@ async function run() {
       }
     });
 
-    // PATCH /books/:id — update status only (publish / unpublish toggle)
     app.patch("/books/:id", verifyToken, async (req, res) => {
       const { status } = req.body;
       if (!["published", "unpublished"].includes(status)) {
@@ -353,8 +361,6 @@ async function run() {
         const book = await booksCollection.findOne({ _id: new ObjectId(req.params.id) });
         if (!book) return res.status(404).json({ error: "Book not found" });
 
-        // ✅ ADMIN PRIORITY: if admin locked this book as unpublished,
-        // only admin can republish it — librarians are blocked
         if (book.adminLocked && status === "published" && req.user.role !== "admin") {
           return res.status(403).json({
             error: "This book was unpublished by an admin and cannot be republished without admin approval.",
@@ -363,16 +369,11 @@ async function run() {
         }
 
         const update = { status };
-        // When admin unpublishes, set adminLocked flag
-        // When admin republishes, clear the lock
         if (req.user.role === "admin") {
-          update.adminLocked = status === "unpublished"; // true when unpublishing, false when republishing
+          update.adminLocked = status === "unpublished";
         }
 
-        await booksCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: update }
-        );
+        await booksCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: update });
         res.json({ message: "Book status updated", adminLocked: update.adminLocked ?? book.adminLocked });
       } catch (err) {
         console.error(err);
@@ -380,7 +381,6 @@ async function run() {
       }
     });
 
-    // ✅ PUT /books/:id — full book edit (used by EditBook.jsx)
     app.put("/books/:id", verifyToken, async (req, res) => {
       const { bookName, authorName, bookImage, description, category, price, pages, rating, status } = req.body;
 
@@ -392,12 +392,10 @@ async function run() {
         const book = await booksCollection.findOne({ _id: new ObjectId(req.params.id) });
         if (!book) return res.status(404).json({ error: "Book not found" });
 
-        // ✅ Librarians can only edit their own books; admins can edit any
         if (req.user.role !== "admin" && book.addedBy !== req.user.email) {
           return res.status(403).json({ error: "You can only edit books you added." });
         }
 
-        // ✅ Librarians cannot override adminLocked — they can't republish a locked book via edit either
         const newStatus = ["published", "unpublished"].includes(status) ? status : "published";
         if (book.adminLocked && newStatus === "published" && req.user.role !== "admin") {
           return res.status(403).json({
@@ -419,11 +417,7 @@ async function run() {
           updatedAt:   new Date(),
         };
 
-        await booksCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: updatedBook }
-        );
-
+        await booksCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: updatedBook });
         res.json({ message: "Book updated successfully" });
       } catch (err) {
         console.error("PUT /books/:id error:", err);
@@ -454,7 +448,6 @@ async function run() {
           return res.json(orders);
         }
 
-        // Regular user — own orders only
         const orders = await ordersCollection
           .find({ email: req.user.email })
           .sort({ orderDate: -1 })
@@ -512,6 +505,106 @@ async function run() {
       } catch (err) {
         console.error(err);
         res.status(500).json({ error: "Failed to update order" });
+      }
+    });
+
+    // ================= WISHLIST ROUTES =================
+    app.get("/wishlists/:email", verifyToken, async (req, res) => {
+      try {
+        const items = await wishlistsCollection
+          .find({ email: req.params.email })
+          .sort({ addedAt: -1 })
+          .toArray();
+        res.json(items);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to fetch wishlist" });
+      }
+    });
+
+    app.post("/wishlists", verifyToken, async (req, res) => {
+      const { email, bookId, bookName, bookImage, authorName, price, category } = req.body;
+      if (!email || !bookId) return res.status(400).json({ error: "Email and bookId required" });
+      try {
+        const existing = await wishlistsCollection.findOne({ email, bookId });
+        if (existing) return res.status(409).json({ error: "Book already in wishlist" });
+
+        const item = { email, bookId, bookName, bookImage, authorName, price, category, addedAt: new Date() };
+        const result = await wishlistsCollection.insertOne(item);
+        res.status(201).json({ message: "Added to wishlist", id: result.insertedId });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to add to wishlist" });
+      }
+    });
+
+    app.delete("/wishlists/:id", verifyToken, async (req, res) => {
+      try {
+        const result = await wishlistsCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: "Wishlist item not found" });
+        res.json({ message: "Removed from wishlist" });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to remove from wishlist" });
+      }
+    });
+
+    // ================= REVIEW ROUTES =================
+    app.get("/reviews/:bookId", async (req, res) => {
+      try {
+        const reviews = await reviewsCollection
+          .find({ bookId: req.params.bookId })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.json(reviews);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to fetch reviews" });
+      }
+    });
+
+    app.post("/reviews", verifyToken, async (req, res) => {
+      const { bookId, rating, comment, userName, userPhoto } = req.body;
+      if (!bookId || !rating) return res.status(400).json({ error: "bookId and rating required" });
+      if (rating < 1 || rating > 5) return res.status(400).json({ error: "Rating must be between 1 and 5" });
+
+      try {
+        // Check user has ordered this book
+        const order = await ordersCollection.findOne({
+          bookId,
+          email: req.user.email,
+          paymentStatus: "paid",
+        });
+        if (!order) {
+          return res.status(403).json({ error: "You can only review books you have purchased." });
+        }
+
+        // One review per user per book
+        const existing = await reviewsCollection.findOne({ bookId, email: req.user.email });
+        if (existing) {
+          // Update existing review
+          await reviewsCollection.updateOne(
+            { _id: existing._id },
+            { $set: { rating: Number(rating), comment: comment?.trim() || "", updatedAt: new Date() } }
+          );
+          return res.json({ message: "Review updated" });
+        }
+
+        const review = {
+          bookId,
+          email: req.user.email,
+          userName: userName || req.user.name || "User",
+          userPhoto: userPhoto || "",
+          rating: Number(rating),
+          comment: comment?.trim() || "",
+          createdAt: new Date(),
+        };
+
+        const result = await reviewsCollection.insertOne(review);
+        res.status(201).json({ message: "Review submitted", id: result.insertedId });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to submit review" });
       }
     });
 
