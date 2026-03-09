@@ -149,7 +149,7 @@ async function run() {
             quantity: 1,
           }],
           mode: "payment",
-          success_url: `${process.env.FRONTEND_URL || "http://localhost:5173"}/my-orders?payment=success`,
+          success_url: `${process.env.FRONTEND_URL || "http://localhost:5173"}/my-orders?payment=success&session_id={CHECKOUT_SESSION_ID}`,
           cancel_url: `${process.env.FRONTEND_URL || "http://localhost:5173"}/my-orders?payment=cancelled`,
           metadata: { orderId: orderId.toString() },
         });
@@ -157,6 +157,29 @@ async function run() {
       } catch (err) {
         console.error("Stripe session error:", err.message);
         res.status(500).json({ error: "Failed to create checkout session" });
+      }
+    });
+
+    app.post("/api/verify-payment", verifyToken, async (req, res) => {
+      const { sessionId } = req.body;
+      if (!sessionId) return res.status(400).json({ error: "Session ID required" });
+
+      try {
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        if (session.payment_status === "paid") {
+          const orderId = session.metadata?.orderId;
+          if (orderId) {
+            const updateResult = await ordersCollection.updateOne(
+              { _id: new ObjectId(orderId), paymentStatus: { $ne: "paid" } },
+              { $set: { paymentStatus: "paid", status: "completed", paidAt: new Date() } }
+            );
+            return res.json({ success: true, updated: updateResult.modifiedCount > 0 });
+          }
+        }
+        res.json({ success: false, message: "Payment not completed" });
+      } catch (err) {
+        console.error("Payment verification error:", err.message);
+        res.status(500).json({ error: "Failed to verify payment" });
       }
     });
 
