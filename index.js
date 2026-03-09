@@ -523,13 +523,16 @@ async function run() {
     });
 
     app.post("/wishlists", verifyToken, async (req, res) => {
-      const { email, bookId, bookName, bookImage, authorName, price, category } = req.body;
-      if (!email || !bookId) return res.status(400).json({ error: "Email and bookId required" });
+      // Frontend sends userId which contains the user's email
+      const { userId, email, bookId, bookName, bookImage, price } = req.body;
+      const userEmail = email || userId || req.user.email;
+
+      if (!userEmail || !bookId) return res.status(400).json({ error: "Email (userId) and bookId required" });
       try {
-        const existing = await wishlistsCollection.findOne({ email, bookId });
+        const existing = await wishlistsCollection.findOne({ email: userEmail, bookId });
         if (existing) return res.status(409).json({ error: "Book already in wishlist" });
 
-        const item = { email, bookId, bookName, bookImage, authorName, price, category, addedAt: new Date() };
+        const item = { email: userEmail, bookId, bookName, bookImage, price, addedAt: new Date() };
         const result = await wishlistsCollection.insertOne(item);
         res.status(201).json({ message: "Added to wishlist", id: result.insertedId });
       } catch (err) {
@@ -564,7 +567,8 @@ async function run() {
     });
 
     app.post("/reviews", verifyToken, async (req, res) => {
-      const { bookId, rating, comment, userName, userPhoto } = req.body;
+      // Frontend sends userImage and date, backend was expecting userPhoto
+      const { bookId, rating, comment, userName, userPhoto, userImage } = req.body;
       if (!bookId || !rating) return res.status(400).json({ error: "bookId and rating required" });
       if (rating < 1 || rating > 5) return res.status(400).json({ error: "Rating must be between 1 and 5" });
 
@@ -579,29 +583,31 @@ async function run() {
           return res.status(403).json({ error: "You can only review books you have purchased." });
         }
 
+        const photo = userImage || userPhoto || "";
+
         // One review per user per book
         const existing = await reviewsCollection.findOne({ bookId, email: req.user.email });
         if (existing) {
           // Update existing review
           await reviewsCollection.updateOne(
             { _id: existing._id },
-            { $set: { rating: Number(rating), comment: comment?.trim() || "", updatedAt: new Date() } }
+            { $set: { rating: Number(rating), comment: comment?.trim() || "", date: new Date() } }
           );
-          return res.json({ message: "Review updated" });
+          return res.json({ message: "Review updated", review: { ...existing, rating: Number(rating), comment: comment?.trim(), date: new Date() } });
         }
 
         const review = {
           bookId,
           email: req.user.email,
           userName: userName || req.user.name || "User",
-          userPhoto: userPhoto || "",
+          userImage: photo,
           rating: Number(rating),
           comment: comment?.trim() || "",
-          createdAt: new Date(),
+          date: new Date(),
         };
 
         const result = await reviewsCollection.insertOne(review);
-        res.status(201).json({ message: "Review submitted", id: result.insertedId });
+        res.status(201).json({ message: "Review submitted", id: result.insertedId, review: { _id: result.insertedId, ...review } });
       } catch (err) {
         console.error(err);
         res.status(500).json({ error: "Failed to submit review" });
